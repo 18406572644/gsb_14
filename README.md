@@ -9,6 +9,9 @@
 - **消息时序可控**：每房间单调递增 `seq`，由计数器在写事务内分配，保证房间内全序
 - **连接管理**：心跳保活、全局/单用户连接数上限、背压断开、优雅退出
 - **房间权限**：管理员 / 成员 / 禁言三种状态，管理员可禁言、解禁
+- **房间邀请**：管理员生成定向邀请（带有效期/使用状态），被邀请人在线实时收到、离线可拉取；
+  过期/已撤销/已拒绝的邀请不可用；接受时服务端校验权限、成员身份与房间人数上限，
+  成员关系落库持久生效（非当前连接临时挂接），房间列表与成员列表同步更新
 - **发送限流**：按用户令牌桶
 
 ## 快速开始
@@ -16,7 +19,7 @@
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 25 个集成测试
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
@@ -46,6 +49,7 @@ test/chat.test.js   集成测试（node:test）
 | `members` | 成员关系：`role`（admin/member）+ `muted_until`（禁言截止时间） |
 | `messages` | 消息。主键 `(room_id, seq)`；唯一键 `(room_id, sender_id, client_msg_id)` 为幂等键 |
 | `cursors` | 每用户每房间已确认游标 `last_ack_seq`，断线补发的服务端兜底依据 |
+| `invites` | 房间邀请：定向到用户，`status`（pending/accepted/declined/revoked/expired）+ `expires_at`，同房间同用户至多一条 pending（部分唯一索引） |
 
 ## 可靠性设计
 
@@ -106,6 +110,12 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `members` | `roomId` | 成员列表（含在线状态） |
 | `mute` | `roomId, userId, minutes` | 禁言（仅管理员，1..1440 分钟） |
 | `unmute` | `roomId, userId` | 解除禁言（仅管理员） |
+| `invite_create` | `roomId, userName, minutes?` | 生成定向邀请（仅管理员；有效期 1..`INVITE_MAX_TTL_MINUTES` 分钟，缺省默认 1440） |
+| `invites` | `roomId` | 房间邀请记录（成员可查，含各状态） |
+| `invite_pending` | — | 发给我的待处理邀请（登录/重连后拉取，离线邀请不丢） |
+| `invite_accept` | `inviteId, lastSeq?` | 接受邀请并加入房间（带进度则立即补发） |
+| `invite_decline` | `inviteId` | 拒绝邀请 |
+| `invite_revoke` | `inviteId` | 撤销邀请（仅管理员，撤销后无法接受） |
 
 ### 服务端 → 客户端
 
@@ -117,12 +127,18 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `ack` | 发送确认：`{roomId, clientMsgId, seq, ts}` |
 | `sync_done` | 一批补发结束：`{roomId, lastSeq, hasMore}` |
 | `history` / `rooms` / `members` | 对应查询的响应 |
-| `notice` | 房间事件（`muted` / `unmuted`） |
-| `error` | `{code, message, ref?}`，code 见下 |
+| `notice` | 房间事件（`muted` / `unmuted` / `member_joined`） |
+| `invite` | 新邀请实时推送给被邀请人的全部设备：`{invite}` |
+| `invite_created` | 邀请生成成功回执：`{invite}` |
+| `invites` / `invite_pending` | 房间邀请记录 / 我的待处理邀请 |
+| `invite_result` | 邀请状态流转：`{inviteId, roomId, status, userId?, userName?}`，status 为 accepted/declined/revoked；接受回执投给被邀请人全部设备，其他设备据此自行 `join` |
+| `error` | `{code, message, action, ref?}`，`action` 为触发错误的请求类型，code 见下 |
 | `server_shutdown` | 服务即将关闭，请准备重连 |
 
 错误码：`BAD_FRAME` `BAD_REQUEST` `UNKNOWN_TYPE` `NOT_MEMBER` `NO_SUCH_ROOM`
-`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`；
+`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`
+`NO_SUCH_USER`（邀请目标不存在）`ALREADY_MEMBER`（已是成员）`ROOM_FULL`（房间满员）
+`NO_SUCH_INVITE`（邀请不存在）`INVITE_EXPIRED`（已过期）`INVITE_NOT_OPEN`（已使用/拒绝/撤销/过期）；
 升级阶段拒绝：`401`（认证失败）、`503 SERVER_FULL` / `503 TOO_MANY_DEVICES`。
 
 ### 连接建立
@@ -145,6 +161,9 @@ GET  /ws?token=<token>            →  WebSocket 升级
 | `MAX_UNACKED_PER_CONN` | `1000` | 单连接未确认积压上限（背压） |
 | `RATE_LIMIT_PER_SEC` / `RATE_LIMIT_BURST` | `10` / `20` | 发送限流令牌桶 |
 | `SYNC_BATCH_SIZE` | `500` | 补发单批条数 |
+| `MAX_ROOM_MEMBERS` | `100` | 房间人数上限（生成邀请与接受时均校验） |
+| `INVITE_DEFAULT_TTL_MINUTES` | `1440` | 邀请默认有效期（分钟） |
+| `INVITE_MAX_TTL_MINUTES` | `10080` | 7 天有效期上限 |
 | `AUTH_SECRET` | — | token HMAC 密钥，**生产必须设置** |
 
 ## 已知边界（演示级取舍）

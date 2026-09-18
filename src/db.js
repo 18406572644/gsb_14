@@ -63,12 +63,41 @@ CREATE TABLE IF NOT EXISTS cursors (
   updated_at   INTEGER NOT NULL,
   PRIMARY KEY (room_id, user_id)
 );
+
+-- 房间邀请：定向发给指定用户，带有效期与使用状态（持久化，重启不丢）
+CREATE TABLE IF NOT EXISTS invites (
+  id          TEXT PRIMARY KEY,
+  room_id     TEXT NOT NULL REFERENCES rooms(id),
+  inviter_id  TEXT NOT NULL REFERENCES users(id),
+  invitee_id  TEXT NOT NULL REFERENCES users(id),
+  status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','accepted','declined','revoked','expired')),
+  expires_at  INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  accepted_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- 同一房间对同一用户至多存在一条待处理邀请
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_open
+  ON invites (room_id, invitee_id) WHERE status = 'pending';
 `;
 
 const MSG_SELECT = `
   SELECT m.room_id AS roomId, m.seq, m.client_msg_id AS clientMsgId,
          m.sender_id AS "from", u.name AS fromName, m.content, m.ts
     FROM messages m JOIN users u ON u.id = m.sender_id
+`;
+
+const INVITE_SELECT = `
+  SELECT i.id, i.room_id AS roomId, r.name AS roomName,
+         i.inviter_id AS inviterId, iu.name AS inviterName,
+         i.invitee_id AS inviteeId, ru.name AS inviteeName,
+         i.status, i.expires_at AS expiresAt,
+         i.created_at AS createdAt, i.accepted_at AS acceptedAt
+    FROM invites i
+    JOIN rooms r ON r.id = i.room_id
+    JOIN users iu ON iu.id = i.inviter_id
+    JOIN users ru ON ru.id = i.invitee_id
 `;
 
 class ChatDB {
@@ -128,6 +157,29 @@ class ChatDB {
          DO UPDATE SET last_ack_seq = MAX(last_ack_seq, excluded.last_ack_seq), updated_at = excluded.updated_at`
       ),
       cursor: d.prepare('SELECT last_ack_seq AS lastAckSeq FROM cursors WHERE room_id = ? AND user_id = ?'),
+
+      // —— 邀请 ——
+      insertInvite: d.prepare(
+        `INSERT INTO invites (id, room_id, inviter_id, invitee_id, status, expires_at, created_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+      ),
+      refreshInvite: d.prepare('UPDATE invites SET expires_at = ?, inviter_id = ? WHERE id = ?'),
+      inviteById: d.prepare(`${INVITE_SELECT} WHERE i.id = ?`),
+      openInviteForUser: d.prepare(
+        `${INVITE_SELECT} WHERE i.room_id = ? AND i.invitee_id = ? AND i.status = 'pending'`
+      ),
+      invitesForRoom: d.prepare(`${INVITE_SELECT} WHERE i.room_id = ? ORDER BY i.created_at DESC`),
+      pendingInvitesForUser: d.prepare(
+        `${INVITE_SELECT} WHERE i.invitee_id = ? AND i.status = 'pending' ORDER BY i.created_at DESC`
+      ),
+      // 仅当邀请仍处于 pending 时才能流转状态（撤销/拒绝/接受），过期/已撤销的邀请无法使用
+      bumpInviteIfPending: d.prepare(
+        `UPDATE invites SET status = ?, accepted_at = ? WHERE id = ? AND status = 'pending' RETURNING id`
+      ),
+      expireInvites: d.prepare(
+        `UPDATE invites SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?`
+      ),
+      countMembers: d.prepare('SELECT COUNT(*) AS n FROM members WHERE room_id = ?'),
     };
   }
 
@@ -223,6 +275,86 @@ class ChatDB {
   getCursor(roomId, userId) {
     const row = this.stmt.cursor.get(roomId, userId);
     return row ? row.lastAckSeq : 0;
+  }
+
+  // ---------- 邀请 ----------
+
+  /**
+   * 创建定向邀请。同房间对同一用户已有待处理邀请时，刷新其有效期（幂等重发）。
+   * 返回邀请行（含房间/邀请人/被邀请人名称）。
+   */
+  createInvite({ id, roomId, inviterId, inviteeId, expiresAt }) {
+    return this._tx(() => {
+      const open = this.stmt.openInviteForUser.get(roomId, inviteeId);
+      if (open) {
+        this.stmt.refreshInvite.run(expiresAt, inviterId, open.id);
+        return this.stmt.inviteById.get(open.id);
+      }
+      this.stmt.insertInvite.run(id, roomId, inviterId, inviteeId, expiresAt, now());
+      return this.stmt.inviteById.get(id);
+    });
+  }
+
+  getInvite(id) { return this.stmt.inviteById.get(id); }
+
+  listInvitesForRoom(roomId) {
+    this.markExpiredInvites();
+    return this.stmt.invitesForRoom.all(roomId);
+  }
+
+  listPendingInvitesForUser(userId) {
+    this.markExpiredInvites();
+    return this.stmt.pendingInvitesForUser.all(userId);
+  }
+
+  /** 把所有到期的待处理邀请置为 expired，返回受影响行数 */
+  markExpiredInvites(t = now()) {
+    return this.stmt.expireInvites.run(t).changes;
+  }
+
+  /** 撤销邀请：仅 pending 可撤销，成功返回 true */
+  revokeInvite(id) {
+    return this.stmt.bumpInviteIfPending.run('revoked', 0, id).changes > 0;
+  }
+
+  /** 拒绝邀请：仅 pending 可拒绝，成功返回 true */
+  declineInvite(id) {
+    return this.stmt.bumpInviteIfPending.run('declined', 0, id).changes > 0;
+  }
+
+  memberCount(roomId) {
+    return this.stmt.countMembers.get(roomId).n;
+  }
+
+  /**
+   * 接受邀请（原子操作）：
+   * 校验「仍 pending、未过期、未入组、未超人数上限」通过后，
+   * 在同一事务内把邀请置为 accepted 并把成员关系落库 —— 成员身份持久生效，
+   * 不是只在当前连接的房间索引里临时挂接。
+   * 返回 { ok:true, invite } 或 { ok:false, reason, invite }。
+   */
+  acceptInvite(id, userId, maxMembers) {
+    return this._tx(() => {
+      const invite = this.stmt.inviteById.get(id);
+      if (!invite) return { ok: false, reason: 'NO_SUCH_INVITE', invite: null };
+      if (invite.inviteeId !== userId) return { ok: false, reason: 'FORBIDDEN', invite };
+      if (invite.status !== 'pending') return { ok: false, reason: 'INVITE_NOT_OPEN', invite };
+      if (invite.expiresAt <= now()) {
+        this.stmt.bumpInviteIfPending.run('expired', 0, id);
+        return { ok: false, reason: 'INVITE_EXPIRED', invite: { ...invite, status: 'expired' } };
+      }
+      if (this.stmt.member.get(invite.roomId, userId)) {
+        // 已在邀请生成后通过其他方式入组：关闭邀请，视为成功（幂等）
+        this.stmt.bumpInviteIfPending.run('accepted', now(), id);
+        return { ok: true, invite: this.stmt.inviteById.get(id), alreadyMember: true };
+      }
+      if (this.stmt.countMembers.get(invite.roomId).n >= maxMembers) {
+        return { ok: false, reason: 'ROOM_FULL', invite };
+      }
+      this.stmt.bumpInviteIfPending.run('accepted', now(), id);
+      this.stmt.upsertMember.run(invite.roomId, userId, 'member', now());
+      return { ok: true, invite: this.stmt.inviteById.get(id), alreadyMember: false };
+    });
   }
 
   close() {

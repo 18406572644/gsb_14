@@ -28,6 +28,11 @@ module.exports = {
   syncBatchSize: Number(process.env.SYNC_BATCH_SIZE || 500), // 断线补发单批最大条数
   historyMaxLimit: Number(process.env.HISTORY_MAX_LIMIT || 100), // 历史消息单次拉取上限
 
+  // 房间与邀请
+  maxRoomMembers: Number(process.env.MAX_ROOM_MEMBERS || 100), // 房间人数上限
+  inviteDefaultTtlMinutes: Number(process.env.INVITE_DEFAULT_TTL_MINUTES || 60 * 24), // 邀请默认有效期
+  inviteMaxTtlMinutes: Number(process.env.INVITE_MAX_TTL_MINUTES || 60 * 24 * 7), // 邀请有效期上限
+
   // 发送限流（令牌桶，按用户）
   rateLimitPerSec: Number(process.env.RATE_LIMIT_PER_SEC || 10),
   rateLimitBurst: Number(process.env.RATE_LIMIT_BURST || 20),
