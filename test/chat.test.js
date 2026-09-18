@@ -106,6 +106,27 @@ async function joinRoom(client, room, lastSeq = 0) {
   return client.waitFor((m) => m.type === 'joined');
 }
 
+async function createRoomCap(client, name, maxOccupancy) {
+  client.send({ type: 'create_room', name, maxOccupancy });
+  const joined = await client.waitFor((m) => m.type === 'joined' && m.name === name);
+  return joined.roomId;
+}
+
+/** 管理员发起邀请，返回 invite_created 帧中的 invite（被邀请人应另行等待 invite_received） */
+async function createInvite(admin, roomId, targetName, ttlMinutes) {
+  admin.send({ type: 'invite_create', roomId, targetName, ...(ttlMinutes ? { ttlMinutes } : {}) });
+  const fr = await admin.waitFor((m) => m.type === 'invite_created' && m.invite.roomId === roomId);
+  return fr.invite;
+}
+
+const acceptInvite = (client, inviteId, lastSeq = 0) =>
+  client.send({ type: 'invite_accept', inviteId, lastSeq });
+
+/** 直接把某邀请改成已过期（协议最短 TTL 为 1 分钟，测试用 DB 注入避免等待） */
+function expireInviteInDb(server, inviteId) {
+  server.db.db.prepare('UPDATE invites SET expires_at = ? WHERE id = ?').run(Date.now() - 1, inviteId);
+}
+
 // ---------------------------------------------------------------- 测试用例
 
 test('登录、连接、建房后成为管理员', async () => {
@@ -444,5 +465,330 @@ test('持久化：服务重启后消息不丢失', async () => {
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- 房间邀请
+
+test('邀请全流程：管理员发起 → 被邀请人收到并接受 → 持久成为成员并广播', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g1');
+
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    assert.ok(inv.id && inv.roomId === roomId);
+    assert.equal(inv.inviteeName, 'bob');
+    assert.ok(inv.expiresAt > Date.now());
+
+    // 被邀请人实时收到推送
+    const recv = await b.waitFor((m) => m.type === 'invite_received' && m.invite.id === inv.id);
+    assert.equal(recv.invite.roomName, 'g1');
+    assert.equal(recv.invite.inviterName, 'alice');
+
+    // invite_list 只返回我的 active 邀请
+    b.send({ type: 'invite_list' });
+    const list = await b.waitFor((m) => m.type === 'invites' && m.scope === 'mine');
+    assert.equal(list.invites.length, 1);
+    assert.equal(list.invites[0].id, inv.id);
+
+    // 管理员视角：该房间全部邀请（含被邀请人名）
+    a.send({ type: 'invite_list', roomId });
+    const rlist = await a.waitFor((m) => m.type === 'invites' && m.scope === 'room');
+    assert.equal(rlist.invites.length, 1);
+    assert.equal(rlist.invites[0].inviteeName, 'bob');
+    assert.equal(rlist.invites[0].status, 'active');
+
+    acceptInvite(b, inv.id);
+    const joined = await b.waitFor((m) => m.type === 'joined' && m.roomId === roomId);
+    assert.equal(joined.role, 'member');
+
+    // 房间内既有成员（管理员）收到 member_joined
+    const mj = await a.waitFor((m) => m.type === 'member_joined' && m.roomId === roomId);
+    assert.equal(mj.member.userId, ub.userId);
+    assert.equal(mj.member.role, 'member');
+
+    // 邀请被收口为 used，从我的在途邀请中消失
+    await b.waitFor((m) => m.type === 'invite_closed' && m.inviteId === inv.id && m.reason === 'used');
+    b.send({ type: 'invite_list' });
+    const list2 = await b.waitFor((m) => m.type === 'invites' && m.scope === 'mine');
+    assert.equal(list2.invites.length, 0);
+    assert.equal(server.db.getInvite(inv.id).status, 'used');
+
+    // 成员身份已持久落库（而非仅当前连接临时加入）
+    assert.ok(server.db.getMember(roomId, ub.userId), 'members 表应有持久记录');
+    // 成员列表同步：管理员视角可见 bob
+    a.send({ type: 'members', roomId });
+    const mem = await a.waitFor((m) => m.type === 'members' && m.roomId === roomId);
+    assert.ok(mem.members.some((x) => x.userId === ub.userId));
+
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('邀请成员身份持久生效：断线重连与服务重启后仍是成员', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-inv-'));
+  const dbPath = path.join(dir, 'inv.db');
+  try {
+    const { server: s1, port: p1 } = await startServer({ dbPath });
+    const ua = await login(p1, 'alice');
+    const ub = await login(p1, 'bob');
+    const a = await Client.connect(p1, ua.token);
+    const roomId = await createRoom(a, 'g2');
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await a.close();
+    s1.stop();
+
+    // —— 重启后接受邀请 ——
+    const { server: s2, port: p2 } = await startServer({ dbPath });
+    const b = await Client.connect(p2, ub.token);
+    acceptInvite(b, inv.id);
+    await b.waitFor((m) => m.type === 'joined' && m.roomId === roomId);
+    assert.ok(s2.db.getMember(roomId, ub.userId), '接受后成员关系落库');
+    await b.close();
+    s2.stop();
+
+    // —— 再次重启，新连接通过 rooms 查询确认成员身份仍在 ——
+    const { server: s3, port: p3 } = await startServer({ dbPath });
+    const b2 = await Client.connect(p3, ub.token);
+    b2.send({ type: 'rooms' });
+    const roomsFr = await b2.waitFor((m) => m.type === 'rooms');
+    assert.ok(roomsFr.rooms.some((r) => r.id === roomId), '重启后仍为该房间成员');
+    await b2.close();
+    s3.stop();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('权限：非管理员不能发起邀请，非目标用户不能接受邀请', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const c = await Client.connect(port, uc.token);
+    const roomId = await createRoom(a, 'g3');
+    await joinRoom(b, roomId);
+
+    // 普通成员发起邀请 → FORBIDDEN
+    b.send({ type: 'invite_create', roomId, targetName: 'carol' });
+    const e1 = await b.waitFor((m) => m.type === 'error' && m.code === 'FORBIDDEN');
+    assert.ok(e1);
+
+    const inv = await createInvite(a, roomId, 'carol', 60);
+    await c.waitFor((m) => m.type === 'invite_received' && m.invite.id === inv.id);
+
+    // bob 不是被邀请人，接受 → FORBIDDEN
+    b.send({ type: 'invite_accept', inviteId: inv.id });
+    const e2 = await b.waitFor((m) => m.type === 'error' && m.code === 'FORBIDDEN');
+    assert.ok(e2);
+    assert.equal(server.db.getInvite(inv.id).status, 'active', '冒用接受不应消费邀请');
+
+    await Promise.all([a.close(), b.close(), c.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('发起邀请校验：目标不存在、已是成员、重复在途邀请、TTL 非法', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    await login(port, 'carol'); // 仅注册账号、暂不连接
+    await login(port, 'dave');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g4');
+    await joinRoom(b, roomId);
+
+    a.send({ type: 'invite_create', roomId, targetName: 'ghost' });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'NO_SUCH_USER');
+
+    a.send({ type: 'invite_create', roomId, targetName: 'bob' });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'ALREADY_MEMBER');
+
+    const inv = await createInvite(a, roomId, 'carol', 60);
+    // 再次对同一用户发起在途邀请 → INVITE_EXISTS
+    a.send({ type: 'invite_create', roomId, targetName: 'carol' });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'INVITE_EXISTS');
+
+    a.send({ type: 'invite_create', roomId, targetName: 'dave', ttlMinutes: 0 });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'BAD_REQUEST');
+    a.send({ type: 'invite_create', roomId, targetName: 'dave', ttlMinutes: 999999 });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'BAD_REQUEST');
+
+    assert.ok(server.db.getInvite(inv.id));
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('过期邀请无法接受，过期后可重新发起', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g5');
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await b.waitFor((m) => m.type === 'invite_received');
+
+    expireInviteInDb(server, inv.id); // 直接置为已过期
+    acceptInvite(b, inv.id);
+    const err = await b.waitFor((m) => m.type === 'error' && m.code === 'INVITE_EXPIRED');
+    assert.ok(err);
+    assert.ok(!server.db.getMember(roomId, ub.userId), '过期接受不得加入');
+    assert.equal(server.db.getInvite(inv.id).status, 'active', '过期未接受仍为 active，待 sweep 收口');
+
+    // 过期后管理员可对同一用户重新发起
+    const inv2 = await createInvite(a, roomId, 'bob', 60);
+    assert.ok(inv2.id && inv2.id !== inv.id);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('撤销邀请：被邀请人接受被拒并收到关闭通知；已撤销不可再撤销', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g6');
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await b.waitFor((m) => m.type === 'invite_received');
+
+    a.send({ type: 'invite_revoke', inviteId: inv.id });
+    await a.waitFor((m) => m.type === 'invite_revoked' && m.inviteId === inv.id);
+    await b.waitFor((m) => m.type === 'invite_closed' && m.inviteId === inv.id && m.reason === 'revoked');
+    assert.equal(server.db.getInvite(inv.id).status, 'revoked');
+
+    acceptInvite(b, inv.id);
+    assert.equal((await b.waitFor((m) => m.type === 'error')).code, 'INVITE_REVOKED');
+
+    a.send({ type: 'invite_revoke', inviteId: inv.id });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'INVITE_UNAVAILABLE');
+
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('人数上限：满员房间不能发起邀请；发起后被占满则接受时拒绝', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const c = await Client.connect(port, uc.token);
+
+    // 上限 1：仅管理员即满员，发起邀请直接被拒
+    const fullRoom = await createRoomCap(a, 'cap1', 1);
+    a.send({ type: 'invite_create', roomId: fullRoom, targetName: 'bob' });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'ROOM_FULL');
+
+    // 上限 2：发起时有空位（alice 1 人）；之后 carol 直接加入占满，bob 接受时被拒
+    const roomId = await createRoomCap(a, 'cap2', 2);
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await joinRoom(c, roomId); // alice + carol = 2，满员
+    acceptInvite(b, inv.id);
+    const err = await b.waitFor((m) => m.type === 'error' && m.code === 'ROOM_FULL');
+    assert.ok(err);
+    assert.equal(server.db.getInvite(inv.id).status, 'active', '满员拒绝不应消费邀请');
+    assert.ok(!server.db.getMember(roomId, ub.userId));
+
+    // carol 离开房间运行时不影响持久成员计数；这里直接校验计数为 2
+    assert.equal(server.db.countMembers(roomId), 2);
+
+    await Promise.all([a.close(), b.close(), c.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('多设备：一台设备接受邀请，同一用户其他在线设备同步入房', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b1 = await Client.connect(port, ub.token);
+    const b2 = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g7');
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await b1.waitFor((m) => m.type === 'invite_received');
+    await b2.waitFor((m) => m.type === 'invite_received');
+
+    acceptInvite(b1, inv.id);
+    await b1.waitFor((m) => m.type === 'joined' && m.roomId === roomId);
+    // 另一台设备被动收到 joined
+    await b2.waitFor((m) => m.type === 'joined' && m.roomId === roomId);
+
+    assert.ok(server.db.getMember(roomId, ub.userId));
+    await Promise.all([a.close(), b1.close(), b2.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('过期扫描：sweep 收口过期邀请并通知被邀请人', async () => {
+  const { server, port } = await startServer({ inviteSweepIntervalMs: 40 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'g8');
+    const inv = await createInvite(a, roomId, 'bob', 60);
+    await b.waitFor((m) => m.type === 'invite_received');
+
+    expireInviteInDb(server, inv.id);
+    await b.waitFor(
+      (m) => m.type === 'invite_closed' && m.inviteId === inv.id && m.reason === 'expired',
+      2000
+    );
+    assert.equal(server.db.getInvite(inv.id).status, 'revoked', 'sweep 应置为 revoked');
+
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('create_room 的 maxOccupancy 非法被拒，默认带人数上限', async () => {
+  const { server, port } = await startServer();
+  try {
+    const u = await login(port, 'alice');
+    const a = await Client.connect(port, u.token);
+    a.send({ type: 'create_room', name: 'badcap', maxOccupancy: -3 });
+    assert.equal((await a.waitFor((m) => m.type === 'error')).code, 'BAD_REQUEST');
+
+    a.send({ type: 'create_room', name: 'okcap' });
+    const j = await a.waitFor((m) => m.type === 'joined' && m.name === 'okcap');
+    assert.equal(j.maxOccupancy, 50, '默认人数上限 50');
+    await a.close();
+  } finally {
+    server.stop();
   }
 });

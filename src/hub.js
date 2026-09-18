@@ -169,6 +169,15 @@ class Hub {
     return delivered;
   }
 
+  /** 发送给某用户的全部在线连接（多端同步，如邀请通知、其他设备被动入房）。返回在线连接数。 */
+  sendToUser(userId, frame) {
+    const set = this.byUser.get(userId);
+    if (!set) return 0;
+    let delivered = 0;
+    for (const conn of set) if (this.send(conn, frame)) delivered++;
+    return delivered;
+  }
+
   /** 心跳扫描：超时未 pong 的连接直接 terminate（触发 close 走正常清理） */
   heartbeatSweep() {
     const t = now();

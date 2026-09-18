@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS rooms (
   name       TEXT NOT NULL UNIQUE,
   created_by TEXT NOT NULL REFERENCES users(id),
   created_at INTEGER NOT NULL,
-  last_seq   INTEGER NOT NULL DEFAULT 0
+  last_seq   INTEGER NOT NULL DEFAULT 0,
+  max_occupancy INTEGER NOT NULL DEFAULT 50  -- 房间人数上限（含管理员），<=0 表示不限
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -43,6 +44,26 @@ CREATE TABLE IF NOT EXISTS members (
   joined_at   INTEGER NOT NULL,
   PRIMARY KEY (room_id, user_id)
 );
+
+-- 房间邀请：管理员定向发给某个已注册用户。
+-- status: active（可用）/ used（已接受）/ revoked（已撤销）。
+-- (room_id, invitee_id) 仅在 active 时唯一 —— 同一房间对同一用户同时只存在
+-- 一张有效邀请，接受/撤销/过期后方可重新发起。
+CREATE TABLE IF NOT EXISTS invites (
+  id          TEXT PRIMARY KEY,
+  room_id     TEXT NOT NULL REFERENCES rooms(id),
+  inviter_id  TEXT NOT NULL REFERENCES users(id),
+  invitee_id  TEXT NOT NULL REFERENCES users(id),
+  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','used','revoked')),
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  used_at     INTEGER,
+  revoked_at  INTEGER,
+  revoked_by  TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_active_pair
+  ON invites (room_id, invitee_id) WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS messages (
   room_id       TEXT NOT NULL REFERENCES rooms(id),
@@ -75,7 +96,16 @@ class ChatDB {
   constructor(dbPath) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(SCHEMA);
+    this._migrate();
     this._prepare();
+  }
+
+  /** 旧库迁移：为已存在的 rooms 补上新增列（CREATE TABLE IF NOT EXISTS 不会改已建表） */
+  _migrate() {
+    const cols = this.db.prepare('PRAGMA table_info(rooms)').all();
+    if (!cols.some((c) => c.name === 'max_occupancy')) {
+      this.db.exec('ALTER TABLE rooms ADD COLUMN max_occupancy INTEGER NOT NULL DEFAULT 50');
+    }
   }
 
   _prepare() {
@@ -85,11 +115,14 @@ class ChatDB {
       userByName: d.prepare('SELECT * FROM users WHERE name = ?'),
       userById: d.prepare('SELECT * FROM users WHERE id = ?'),
 
-      insertRoom: d.prepare('INSERT INTO rooms (id, name, created_by, created_at) VALUES (?, ?, ?, ?)'),
+      insertRoom: d.prepare(
+        'INSERT INTO rooms (id, name, created_by, created_at, max_occupancy) VALUES (?, ?, ?, ?, ?)'
+      ),
       roomById: d.prepare('SELECT * FROM rooms WHERE id = ?'),
       roomByName: d.prepare('SELECT * FROM rooms WHERE name = ?'),
       roomsForUser: d.prepare(
-        `SELECT r.id, r.name, r.last_seq AS lastSeq, m.role, m.muted_until AS mutedUntil
+        `SELECT r.id, r.name, r.last_seq AS lastSeq, r.max_occupancy AS maxOccupancy,
+                m.role, m.muted_until AS mutedUntil
            FROM rooms r JOIN members m ON m.room_id = r.id
           WHERE m.user_id = ? ORDER BY r.created_at`
       ),
@@ -102,8 +135,47 @@ class ChatDB {
       member: d.prepare('SELECT * FROM members WHERE room_id = ? AND user_id = ?'),
       setMuted: d.prepare('UPDATE members SET muted_until = ? WHERE room_id = ? AND user_id = ?'),
       membersOfRoom: d.prepare(
-        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil
+        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil, m.joined_at AS joinedAt
            FROM members m JOIN users u ON u.id = m.user_id WHERE m.room_id = ?`
+      ),
+      countMembers: d.prepare('SELECT COUNT(*) AS n FROM members WHERE room_id = ?'),
+
+      // —— 邀请 ——
+      insertInvite: d.prepare(
+        `INSERT INTO invites (id, room_id, inviter_id, invitee_id, status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?)`
+      ),
+      inviteById: d.prepare('SELECT * FROM invites WHERE id = ?'),
+      activeInviteForPair: d.prepare(
+        `SELECT * FROM invites WHERE room_id = ? AND invitee_id = ? AND status = 'active'`
+      ),
+      // 「我收到的」邀请（默认只列 active，可通过 includeAll 拉历史）
+      invitesForInvitee: d.prepare(
+        `SELECT i.id, i.room_id AS roomId, r.name AS roomName, i.inviter_id AS inviterId,
+                u.name AS inviterName, i.status, i.created_at AS createdAt,
+                i.expires_at AS expiresAt, i.used_at AS usedAt, i.revoked_at AS revokedAt
+           FROM invites i
+           JOIN rooms r ON r.id = i.room_id
+           JOIN users u ON u.id = i.inviter_id
+          WHERE i.invitee_id = ? AND i.status = 'active'
+          ORDER BY i.created_at DESC`
+      ),
+      invitesForRoom: d.prepare(
+        `SELECT i.id, i.room_id AS roomId, i.invitee_id AS inviteeId, u.name AS inviteeName,
+                i.inviter_id AS inviterId, i.status, i.created_at AS createdAt,
+                i.expires_at AS expiresAt, i.used_at AS usedAt, i.revoked_at AS revokedAt
+           FROM invites i JOIN users u ON u.id = i.invitee_id
+          WHERE i.room_id = ? ORDER BY i.created_at DESC`
+      ),
+      markInviteUsed: d.prepare(
+        `UPDATE invites SET status = 'used', used_at = ? WHERE id = ? AND status = 'active'`
+      ),
+      revokeInvite: d.prepare(
+        `UPDATE invites SET status = 'revoked', revoked_at = ?, revoked_by = ?
+         WHERE id = ? AND status = 'active'`
+      ),
+      expiredInviteIds: d.prepare(
+        `SELECT id FROM invites WHERE status = 'active' AND expires_at <= ?`
       ),
 
       // —— 消息写入（事务内使用）——
@@ -156,9 +228,9 @@ class ChatDB {
 
   // ---------- 房间与成员 ----------
 
-  createRoom(id, name, creatorId) {
+  createRoom(id, name, creatorId, maxOccupancy = 50) {
     return this._tx(() => {
-      this.stmt.insertRoom.run(id, name, creatorId, now());
+      this.stmt.insertRoom.run(id, name, creatorId, now(), maxOccupancy);
       // 创建者即管理员
       this.stmt.upsertMember.run(id, creatorId, 'admin', now());
       return this.stmt.roomById.get(id);
@@ -169,6 +241,7 @@ class ChatDB {
   getRoomByName(name) { return this.stmt.roomByName.get(name); }
   listRoomsForUser(userId) { return this.stmt.roomsForUser.all(userId); }
   listMembers(roomId) { return this.stmt.membersOfRoom.all(roomId); }
+  countMembers(roomId) { return this.stmt.countMembers.get(roomId).n; }
 
   joinRoom(roomId, userId) {
     this.stmt.upsertMember.run(roomId, userId, 'member', now());
@@ -181,6 +254,85 @@ class ChatDB {
   setMuted(roomId, userId, mutedUntil) {
     this.stmt.setMuted.run(mutedUntil, roomId, userId);
     return this.stmt.member.get(roomId, userId);
+  }
+
+  // ---------- 邀请 ----------
+
+  createInvite({ id, roomId, inviterId, inviteeId, expiresAt }) {
+    this.stmt.insertInvite.run(id, roomId, inviterId, inviteeId, now(), expiresAt);
+    return this.stmt.inviteById.get(id);
+  }
+
+  getInvite(id) { return this.stmt.inviteById.get(id); }
+
+  /** 该房间对该用户当前是否已有 active 邀请（partial unique index 的应用侧预判） */
+  getActiveInviteForPair(roomId, inviteeId) {
+    return this.stmt.activeInviteForPair.get(roomId, inviteeId);
+  }
+
+  listInvitesForInvitee(inviteeId) { return this.stmt.invitesForInvitee.all(inviteeId); }
+  listInvitesForRoom(roomId) { return this.stmt.invitesForRoom.all(roomId); }
+
+  /**
+   * 原子接受邀请：在同一 IMMEDIATE 事务内
+   *   1) 把指定 active 邀请标记为 used（条件 UPDATE，影响行数为 0 说明已被并发用掉/撤销）；
+   *   2) 校验成员上限；
+   *   3) upsert 成员关系（持久生效）。
+   * 返回 { ok:true, member, alreadyMember } 或 { ok:false, reason }。
+   * 过期判定由 expiresAt 与当前时间比较在应用层完成。
+   */
+  acceptInvite(inviteId, { maxOccupancy }) {
+    return this._tx(() => {
+      const invite = this.stmt.inviteById.get(inviteId);
+      if (!invite) return { ok: false, reason: 'NO_SUCH_INVITE' };
+      if (invite.status !== 'active') {
+        return { ok: false, reason: invite.status === 'revoked' ? 'INVITE_REVOKED' : 'INVITE_USED' };
+      }
+      if (invite.expires_at <= now()) return { ok: false, reason: 'INVITE_EXPIRED' };
+
+      const existing = this.stmt.member.get(invite.room_id, invite.invitee_id);
+      if (existing) {
+        // 已是成员：把邀请收口为 used，避免悬挂的 active 邀请
+        this.stmt.markInviteUsed.run(now(), inviteId);
+        return { ok: true, alreadyMember: true, member: existing, invite };
+      }
+
+      const n = this.stmt.countMembers.get(invite.room_id).n;
+      if (maxOccupancy > 0 && n >= maxOccupancy) return { ok: false, reason: 'ROOM_FULL' };
+
+      // 条件 UPDATE：仅当仍为 active 才置 used，返回变化行数
+      const info = this.stmt.markInviteUsed.run(now(), inviteId);
+      if (info.changes === 0) return { ok: false, reason: 'INVITE_UNAVAILABLE' };
+
+      const ts = now();
+      this.stmt.upsertMember.run(invite.room_id, invite.invitee_id, 'member', ts);
+      const member = this.stmt.member.get(invite.room_id, invite.invitee_id);
+      return { ok: true, alreadyMember: false, member, invite };
+    });
+  }
+
+  /** 撤销邀请。仅 active 可撤销，返回是否实际撤销 */
+  revokeInvite(inviteId, revokedBy) {
+    const info = this.stmt.revokeInvite.run(now(), revokedBy, inviteId);
+    return info.changes > 0;
+  }
+
+  /**
+   * 把过期的 active 邀请批量标记为 revoked，返回被收口的邀请（含 roomId/inviteeId，
+   * 供服务端通知目标用户刷新邀请列表）。
+   */
+  sweepExpiredInvites() {
+    return this._tx(() => {
+      const due = this.stmt.expiredInviteIds.all(now());
+      if (due.length === 0) return [];
+      const expired = [];
+      for (const { id } of due) {
+        const invite = this.stmt.inviteById.get(id);
+        const info = this.stmt.revokeInvite.run(now(), null, id);
+        if (info.changes > 0) expired.push(invite);
+      }
+      return expired;
+    });
   }
 
   // ---------- 消息 ----------

@@ -38,6 +38,34 @@
   #members .tag.muted { color: #e05252; }
   #members button { padding: 2px 6px; font-size: 11px; margin-left: auto; }
   .hidden { display: none !important; }
+
+  /* —— 邀请 —— */
+  #invitePanel { display: flex; flex-direction: column; gap: 6px; }
+  #invitePanel h3, #members h3 { font-size: 12px; color: #7f8db3; font-weight: 600; }
+  .invite { background: #1c2539; border: 1px solid #2a3550; border-radius: 6px; padding: 8px;
+            display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+  .invite .meta { color: #7f8db3; }
+  .invite button { padding: 4px 8px; font-size: 12px; }
+  .invite.expired { opacity: .55; }
+  .invite.expired button { background: #555; border-color: #555; }
+  .ri-row { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; }
+  .ri-row button { padding: 2px 6px; font-size: 11px; margin-left: auto; background: #444c63; border-color: #444c63; }
+  .ri-status { color: #7f8db3; font-size: 11px; }
+  .ri-status.used { color: #3ecf6e; }
+  .ri-status.revoked, .ri-status.expired { color: #e05252; }
+  .mhead { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .mhead .cnt { font-size: 11px; color: #7f8db3; margin-left: auto; }
+  .mhead button { padding: 2px 6px; font-size: 11px; background: #2f6fed; border-color: #2f6fed; }
+
+  /* —— Toast —— */
+  #toasts { position: fixed; top: 48px; left: 50%; transform: translateX(-50%); z-index: 50;
+            display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .toast { padding: 8px 14px; border-radius: 8px; font-size: 13px; color: #fff; max-width: 420px;
+           box-shadow: 0 4px 16px rgba(0,0,0,.4); animation: toast-in .15s ease-out; }
+  .toast.ok { background: #1f7a43; }
+  .toast.err { background: #a23535; }
+  .toast.info { background: #2f4a7a; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 </style>
 </head>
 <body>
@@ -60,6 +88,10 @@
       </form>
       <button id="joinBtn">加入房间</button>
       <div id="roomList"></div>
+      <div id="invitePanel" class="hidden">
+        <h3>收到的房间邀请</h3>
+        <div id="inviteList"></div>
+      </div>
     </div>
   </div>
 
@@ -73,6 +105,8 @@
 
   <div id="members" class="hidden"></div>
 </main>
+
+<div id="toasts"></div>
 
 <script>
 'use strict';
@@ -88,6 +122,19 @@ let ws = null, me = null, currentRoom = null;
 const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
 
+// 邀请状态
+const myInvites = new Map();    // 我收到的邀请：inviteId -> invite
+const roomInvites = new Map();  // 管理员视角：roomId -> 该房间发出的邀请列表
+let currentMembers = [];        // 当前房间成员（房间邀请列表到达时复用渲染）
+let expectJoinRoomId = null;    // 接受邀请后期望 joined 的房间（用于自动切换 + 成功提示）
+
+// 邀请相关错误码用 toast 弹出（接受邀请时往往还不在该房间，无法写进消息流）
+const INVITE_ERRORS = new Set([
+  'NO_SUCH_USER', 'ALREADY_MEMBER', 'ROOM_FULL', 'NO_SUCH_INVITE',
+  'INVITE_EXISTS', 'INVITE_EXPIRED', 'INVITE_REVOKED', 'INVITE_USED', 'INVITE_UNAVAILABLE',
+]);
+const INVITE_STATUS_TEXT = { active: '进行中', used: '已使用', revoked: '已撤销' };
+
 const store = {
   key: () => 'chat:' + me.name,
   load() { try { return JSON.parse(localStorage.getItem(this.key())) || {}; } catch { return {}; } },
@@ -100,6 +147,19 @@ const store = {
 
 function setStatus(cls, text) {
   $('status').className = cls; $('statusText').textContent = text;
+}
+
+/** 轻提示：邀请接受/生成的成功或失败反馈（不依赖具体房间消息流） */
+function toast(kind, text, ms = 3500) {
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = text;
+  $('toasts').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, ms - 300);
+  setTimeout(() => el.remove(), ms);
+}
+function fmtExpire(ts) {
+  return new Date(ts).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 async function login(name) {
@@ -120,6 +180,8 @@ function connect() {
     for (const [roomId, info] of Object.entries(saved)) {
       ws.send(JSON.stringify({ type: 'join', room: roomId, lastSeq: info.lastSeenSeq || 0 }));
     }
+    // 重连后重新拉取在途邀请（刷新页面/换设备也能看到待处理邀请）
+    ws.send(JSON.stringify({ type: 'invite_list' }));
   };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -139,10 +201,19 @@ function handle(m) {
       const saved = store.load();
       const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
       r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
+      r.maxOccupancy = m.maxOccupancy;
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
       rooms.set(m.roomId, r);
-      if (!currentRoom) currentRoom = m.roomId;
-      renderRooms(); render(); refreshMembers();
+      store.save();
+      // 接受邀请触发的 joined：自动切到新房间并提示成功；普通重连入房不抢焦点
+      if (expectJoinRoomId === m.roomId) {
+        expectJoinRoomId = null;
+        currentRoom = m.roomId;
+        toast('ok', `已加入房间「${m.name}」`);
+      } else if (!currentRoom) {
+        currentRoom = m.roomId;
+      }
+      activateRoom();
       break;
     }
     case 'msg': {
@@ -181,11 +252,61 @@ function handle(m) {
       refreshMembers();
       break;
     }
+    case 'member_joined': {
+      const r = rooms.get(m.roomId);
+      if (r && m.member.userId !== me.userId) sys(m.roomId, `${m.member.name} 通过邀请加入了房间`);
+      refreshMembers(); // 邀请成功后同步成员列表
+      break;
+    }
     case 'members':
+      currentMembers = m.members || [];
       if (m.roomId === currentRoom) renderMembers(m.members);
       break;
+
+    // —— 邀请 ——
+    case 'invites': {
+      if (m.scope === 'mine') {
+        myInvites.clear();
+        for (const inv of m.invites) myInvites.set(inv.id, inv);
+        renderMyInvites();
+      } else if (m.scope === 'room' && m.roomId === currentRoom) {
+        roomInvites.set(m.roomId, m.invites);
+        renderRoomInvites(m.invites);
+      }
+      break;
+    }
+    case 'invite_received': {
+      myInvites.set(m.invite.id, m.invite);
+      renderMyInvites();
+      toast('info', `收到来自「${m.invite.inviterName}」的房间邀请：${m.invite.roomName}`);
+      break;
+    }
+    case 'invite_created':
+      toast('ok', '邀请已生成并发送，等待对方接受');
+      // 刷新当前房间管理员视角的邀请列表
+      if (currentRoom) send({ type: 'invite_list', roomId: currentRoom });
+      break;
+    case 'invite_revoked':
+      toast('ok', '邀请已撤销');
+      if (m.roomId) send({ type: 'invite_list', roomId: m.roomId });
+      break;
+    case 'invite_closed': {
+      // 我收到的邀请被收口（used/revoked/expired）：移除并刷新；若是接受导致的 used，
+      // 房间已由 joined 处理切换，这里只收起条目
+      myInvites.delete(m.inviteId);
+      renderMyInvites();
+      if (m.reason === 'revoked') toast('err', '该邀请已被管理员撤销');
+      else if (m.reason === 'expired') toast('err', '该邀请已过期');
+      break;
+    }
     case 'error':
-      sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      // 邀请类操作（多在目标房间之外发生）用全局 toast，其余照旧写入消息流
+      if (INVITE_ERRORS.has(m.code)) {
+        expectJoinRoomId = null; // 接受失败：取消待入房标记
+        toast('err', `[${m.code}] ${m.message}`);
+      } else {
+        sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      }
       break;
     case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
   }
@@ -226,8 +347,16 @@ function renderRooms() {
        <span class="badge">${r.role === 'admin' ? '管理员' : ''}</span>
      </div>`).join('');
   for (const el of $('roomList').children) {
-    el.onclick = () => { currentRoom = el.dataset.id; renderRooms(); render(); refreshMembers(); };
+    el.onclick = () => { currentRoom = el.dataset.id; activateRoom(); };
   }
+}
+
+/** 切换/进入房间：刷新成员；管理员额外拉取本房间邀请 */
+function activateRoom() {
+  renderRooms(); render(); refreshMembers();
+  const r = rooms.get(currentRoom);
+  if (r && r.role === 'admin') send({ type: 'invite_list', roomId: currentRoom });
+  else renderRoomInvites([]);
 }
 
 function render() {
@@ -249,21 +378,28 @@ function render() {
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
+// 把 members 响应接进渲染（含管理员的「发起邀请」入口与本房间邀请列表容器）
 function renderMembers(list) {
   const r = rooms.get(currentRoom); if (!r) return;
-  $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
-    const muted = m.mutedUntil > Date.now();
-    const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
-      ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
-               : `<button data-act="mute" data-uid="${m.userId}">禁言</button>`) : '';
-    return `<div class="m"><span class="dot ${m.online ? 'on' : ''}"></span>
-      ${escapeHtml(m.name)}
-      ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
-      ${muted ? '<span class="tag muted">禁言中</span>' : ''}
-      ${adminBtns}</div>`;
-  }).join('');
-  $('members').querySelectorAll('button').forEach((b) => {
+  const cap = r.maxOccupancy > 0 ? ` / ${r.maxOccupancy}` : '';
+  const inviteBtn = r.role === 'admin'
+    ? '<button id="newInviteBtn" title="向已注册用户发起邀请">＋ 邀请</button>' : '';
+  $('members').innerHTML = `
+    <div class="mhead"><h3>成员</h3><span class="cnt">${list.length}${cap}</span>${inviteBtn}</div>
+    <div id="memberList">${list.map((m) => {
+      const muted = m.mutedUntil > Date.now();
+      const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
+        ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
+                 : `<button data-act="mute" data-uid="${m.userId}">禁言</button>`) : '';
+      return `<div class="m"><span class="dot ${m.online ? 'on' : ''}"></span>
+        ${escapeHtml(m.name)}
+        ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
+        ${muted ? '<span class="tag muted">禁言中</span>' : ''}
+        ${adminBtns}</div>`;
+    }).join('')}</div>
+    ${r.role === 'admin' ? '<div id="roomInvitesWrap" style="margin-top:10px"></div>' : ''}`;
+
+  $('members').querySelectorAll('button[data-act]').forEach((b) => {
     b.onclick = () => {
       if (b.dataset.act === 'mute') {
         const mins = prompt('禁言时长（分钟）', '10');
@@ -273,6 +409,76 @@ function renderMembers(list) {
       }
     };
   });
+  const nib = $('newInviteBtn');
+  if (nib) nib.onclick = onCreateInvite;
+
+  renderRoomInvites(roomInvites.get(currentRoom) || []);
+}
+
+/** 管理员视角：本房间已发出的邀请及状态（active 可撤销） */
+function renderRoomInvites(list) {
+  const wrap = $('roomInvitesWrap');
+  if (!wrap) return;
+  if (!list.length) { wrap.innerHTML = '<h3>房间邀请</h3><div class="ri-status">暂无邀请</div>'; return; }
+  wrap.innerHTML = '<h3>房间邀请</h3>' + list.map((inv) => {
+    const t = Date.now();
+    let state, cls;
+    if (inv.status === 'used') { state = '已接受'; cls = 'used'; }
+    else if (inv.status === 'revoked') { state = '已撤销'; cls = 'revoked'; }
+    else if (inv.expiresAt <= t) { state = '已过期'; cls = 'expired'; }
+    else { state = `${INVITE_STATUS_TEXT.active} · 至 ${fmtExpire(inv.expiresAt)}`; cls = 'active'; }
+    const revokeBtn = inv.status === 'active' && inv.expiresAt > t
+      ? `<button data-revoke="${inv.id}">撤销</button>` : '';
+    return `<div class="ri-row"><span>${escapeHtml(inv.inviteeName)}</span>
+      <span class="ri-status ${cls}">${state}</span>${revokeBtn}</div>`;
+  }).join('');
+  wrap.querySelectorAll('button[data-revoke]').forEach((b) => {
+    b.onclick = () => send({ type: 'invite_revoke', inviteId: b.dataset.revoke });
+  });
+}
+
+/** 管理员发起邀请：输入目标用户昵称 + 有效期（分钟） */
+function onCreateInvite() {
+  const targetName = prompt('邀请的目标用户昵称（需已注册）');
+  if (!targetName) return;
+  const ttl = prompt('有效期（分钟，1..10080，默认 1440 即 24 小时）', '1440');
+  if (ttl === null) return;
+  const payload = { type: 'invite_create', roomId: currentRoom, targetName: targetName.trim() };
+  const n = Number(ttl);
+  if (ttl.trim() !== '' && Number.isInteger(n)) payload.ttlMinutes = n;
+  send(payload);
+}
+
+/** 被邀请人视角：侧栏「收到的房间邀请」列表 */
+function renderMyInvites() {
+  const panel = $('invitePanel');
+  const list = [...myInvites.values()];
+  panel.classList.toggle('hidden', list.length === 0);
+  $('inviteList').innerHTML = list.map((inv) => {
+    const expired = inv.expiresAt <= Date.now();
+    const state = expired ? '已过期' : `有效期至 ${fmtExpire(inv.expiresAt)}`;
+    const btn = expired
+      ? '<button disabled>已过期</button>'
+      : `<button data-accept="${inv.id}">接受邀请</button>`;
+    return `<div class="invite ${expired ? 'expired' : ''}">
+      <div><b>${escapeHtml(inv.roomName)}</b> 的房间邀请</div>
+      <div class="meta">邀请人：${escapeHtml(inv.inviterName || '管理员')}</div>
+      <div class="meta">${state}</div>${btn}</div>`;
+  }).join('');
+  $('inviteList').querySelectorAll('button[data-accept]').forEach((b) => {
+    b.onclick = () => acceptInvite(b.dataset.accept);
+  });
+}
+
+/** 接受邀请：成功后服务端回 joined（自动切房+提示），各类失败由 error 帧 toast 提示 */
+function acceptInvite(inviteId) {
+  const inv = myInvites.get(inviteId);
+  if (!inv) return;
+  if (inv.expiresAt <= Date.now()) { toast('err', '该邀请已过期'); renderMyInvites(); return; }
+  expectJoinRoomId = inv.roomId;
+  // 携带本地已有的该房间进度（一般为 0），服务端据此补发
+  const saved = store.load()[inv.roomId];
+  send({ type: 'invite_accept', inviteId, lastSeq: saved?.lastSeenSeq || 0 });
 }
 
 function escapeHtml(s) {

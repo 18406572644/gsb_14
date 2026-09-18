@@ -28,6 +28,15 @@ module.exports = {
   syncBatchSize: Number(process.env.SYNC_BATCH_SIZE || 500), // 断线补发单批最大条数
   historyMaxLimit: Number(process.env.HISTORY_MAX_LIMIT || 100), // 历史消息单次拉取上限
 
+  // 房间
+  defaultMaxOccupancy: Number(process.env.DEFAULT_MAX_OCCUPANCY || 50), // 新建房间默认人数上限（0 表示不限）
+  maxOccupancyLimit: Number(process.env.MAX_OCCUPANCY_LIMIT || 100_000), // create_room 可设置的上限边界
+
+  // 房间邀请
+  inviteDefaultTtlMinutes: Number(process.env.INVITE_DEFAULT_TTL_MINUTES || 1_440), // 默认有效期 24 小时
+  inviteMaxTtlMinutes: Number(process.env.INVITE_MAX_TTL_MINUTES || 10_080), // 最长有效期 7 天
+  inviteSweepIntervalMs: Number(process.env.INVITE_SWEEP_INTERVAL_MS || 30_000), // 过期邀请收口扫描周期
+
   // 发送限流（令牌桶，按用户）
   rateLimitPerSec: Number(process.env.RATE_LIMIT_PER_SEC || 10),
   rateLimitBurst: Number(process.env.RATE_LIMIT_BURST || 20),

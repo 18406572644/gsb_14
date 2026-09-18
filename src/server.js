@@ -65,6 +65,19 @@ function msgFrame(m) {
   };
 }
 
+/** 入房成功帧（create_room / join / invite_accept 共用） */
+function joinedFrame(room, member) {
+  return {
+    type: 'joined',
+    roomId: room.id,
+    name: room.name,
+    role: member.role,
+    mutedUntil: member.muted_until,
+    lastSeq: room.last_seq,
+    maxOccupancy: room.max_occupancy,
+  };
+}
+
 function createChatServer(overrides = {}) {
   const config = { ...defaultConfig, ...overrides };
   const db = new ChatDB(config.dbPath);
@@ -96,6 +109,27 @@ function createChatServer(overrides = {}) {
     return member;
   }
 
+  /** 原始 invite 行 -> 下发对象（含房间名/邀请人名/被邀请人名） */
+  function inviteView(inv) {
+    const room = db.getRoom(inv.room_id);
+    const inviter = db.getUserById(inv.inviter_id);
+    const invitee = db.getUserById(inv.invitee_id);
+    return {
+      id: inv.id,
+      roomId: inv.room_id,
+      roomName: room ? room.name : inv.room_id,
+      inviterId: inv.inviter_id,
+      inviterName: inviter ? inviter.name : '',
+      inviteeId: inv.invitee_id,
+      inviteeName: invitee ? invitee.name : '',
+      status: inv.status,
+      createdAt: inv.created_at,
+      expiresAt: inv.expires_at,
+      usedAt: inv.used_at ?? undefined,
+      revokedAt: inv.revoked_at ?? undefined,
+    };
+  }
+
   const handlers = {
     ping(conn, msg) {
       hub.send(conn, { type: 'pong', t: msg.t });
@@ -104,33 +138,36 @@ function createChatServer(overrides = {}) {
     create_room(conn, msg) {
       if (!isNonEmptyString(msg.name, 64)) fail('BAD_REQUEST', 'invalid room name');
       if (db.getRoomByName(msg.name)) fail('ROOM_EXISTS', 'room name already taken');
-      const room = db.createRoom(randomId('r_'), msg.name, conn.userId);
+      let maxOccupancy = config.defaultMaxOccupancy;
+      if (msg.maxOccupancy !== undefined && msg.maxOccupancy !== null) {
+        if (!Number.isInteger(msg.maxOccupancy) || msg.maxOccupancy < 0) {
+          fail('BAD_REQUEST', 'maxOccupancy must be a non-negative integer');
+        }
+        if (config.maxOccupancyLimit > 0 && msg.maxOccupancy > config.maxOccupancyLimit) {
+          fail('BAD_REQUEST', `maxOccupancy must be <= ${config.maxOccupancyLimit}`);
+        }
+        maxOccupancy = msg.maxOccupancy;
+      }
+      const room = db.createRoom(randomId('r_'), msg.name, conn.userId, maxOccupancy);
       hub.joinRoom(conn, room.id);
-      hub.send(conn, {
-        type: 'joined',
-        roomId: room.id,
-        name: room.name,
-        role: 'admin',
-        mutedUntil: 0,
-        lastSeq: 0,
-      });
+      hub.send(conn, joinedFrame(room, db.getMember(room.id, conn.userId)));
     },
 
     join(conn, msg) {
       if (!isNonEmptyString(msg.room, 128)) fail('BAD_REQUEST', 'invalid room');
       const room = db.getRoom(msg.room) || db.getRoomByName(msg.room);
       if (!room) fail('NO_SUCH_ROOM', 'room not found');
+      const wasMember = !!db.getMember(room.id, conn.userId);
+      if (!wasMember) {
+        // 直接加入同样受人数上限约束
+        if (room.max_occupancy > 0 && db.countMembers(room.id) >= room.max_occupancy) {
+          fail('ROOM_FULL', 'room has reached its member limit');
+        }
+      }
       db.joinRoom(room.id, conn.userId);
       hub.joinRoom(conn, room.id);
       const member = db.getMember(room.id, conn.userId);
-      hub.send(conn, {
-        type: 'joined',
-        roomId: room.id,
-        name: room.name,
-        role: member.role,
-        mutedUntil: member.muted_until,
-        lastSeq: room.last_seq,
-      });
+      hub.send(conn, joinedFrame(room, member));
       // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
       const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
       if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
@@ -242,6 +279,174 @@ function createChatServer(overrides = {}) {
         userId: msg.userId,
         by: conn.userId,
       });
+    },
+
+    // ------------------------------------------------ 房间邀请
+
+    /**
+     * 管理员生成定向邀请。
+     * 入参：{roomId, targetName? / targetUserId?, ttlMinutes?}
+     * 校验：邀请人须为本房间管理员；目标用户须存在且尚不是本房间成员；
+     *      房间未达人数上限（接受时还会在事务内二次校验）；同房间对同用户无在途 active 邀请。
+     */
+    invite_create(conn, msg) {
+      if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
+      requireAdmin(conn, msg.roomId); // 邀请人房间权限
+      const room = db.getRoom(msg.roomId);
+      if (!room) fail('NO_SUCH_ROOM', 'room not found');
+
+      let target = null;
+      if (isNonEmptyString(msg.targetUserId, 128)) {
+        target = db.getUserById(msg.targetUserId);
+      } else if (isNonEmptyString(msg.targetName, 64)) {
+        target = db.getUserByName(msg.targetName);
+      } else {
+        fail('BAD_REQUEST', 'targetName or targetUserId required');
+      }
+      if (!target) fail('NO_SUCH_USER', 'target user not found');
+      if (db.getMember(room.id, target.id)) fail('ALREADY_MEMBER', 'target is already a member');
+      if (room.max_occupancy > 0 && db.countMembers(room.id) >= room.max_occupancy) {
+        fail('ROOM_FULL', 'room has reached its member limit');
+      }
+
+      let ttl = config.inviteDefaultTtlMinutes;
+      if (msg.ttlMinutes !== undefined && msg.ttlMinutes !== null) {
+        ttl = Number(msg.ttlMinutes);
+        if (!Number.isInteger(ttl) || ttl < 1 || ttl > config.inviteMaxTtlMinutes) {
+          fail('BAD_REQUEST', `ttlMinutes must be 1..${config.inviteMaxTtlMinutes}`);
+        }
+      }
+      // 同一房间对同一用户只允许一张在途 active 邀请；若旧邀请已过期（尚未被 sweep
+      // 收口），先撤销旧的，再重新发起 —— 过期邀请不应阻塞管理员重发。
+      const pending = db.getActiveInviteForPair(room.id, target.id);
+      if (pending) {
+        if (pending.expires_at > now()) {
+          fail('INVITE_EXISTS', 'an active invite for this user already exists');
+        }
+        db.revokeInvite(pending.id, conn.userId);
+        hub.sendToUser(target.id, {
+          type: 'invite_closed', inviteId: pending.id, roomId: room.id, reason: 'expired',
+        });
+      }
+
+      const expiresAt = now() + ttl * 60_000;
+      let invite;
+      try {
+        invite = db.createInvite({
+          id: randomId('inv_'),
+          roomId: room.id,
+          inviterId: conn.userId,
+          inviteeId: target.id,
+          expiresAt,
+        });
+      } catch (err) {
+        // 并发下命中 partial unique index —— 同一用户已有 active 邀请
+        if (String(err.message).includes('UNIQUE constraint failed: invites')) {
+          fail('INVITE_EXISTS', 'an active invite for this user already exists');
+        }
+        throw err;
+      }
+
+      const view = inviteView(invite);
+      hub.send(conn, { type: 'invite_created', invite: view });
+      // 通知被邀请人的所有在线设备（多端一致）
+      hub.sendToUser(target.id, { type: 'invite_received', invite: view });
+    },
+
+    /**
+     * 列出邀请：
+     *  - 不带 roomId：我收到的 active 邀请；
+     *  - 带 roomId：该房间管理员查看本房间全部邀请（含 used/revoked）。
+     */
+    invite_list(conn, msg) {
+      if (isNonEmptyString(msg.roomId, 128)) {
+        requireAdmin(conn, msg.roomId);
+        hub.send(conn, { type: 'invites', scope: 'room', roomId: msg.roomId,
+          invites: db.listInvitesForRoom(msg.roomId) });
+        return;
+      }
+      hub.send(conn, { type: 'invites', scope: 'mine', invites: db.listInvitesForInvitee(conn.userId) });
+    },
+
+    /** 管理员撤销邀请：active -> revoked，并通知被邀请人 */
+    invite_revoke(conn, msg) {
+      if (!isNonEmptyString(msg.inviteId, 128)) fail('BAD_REQUEST', 'invalid inviteId');
+      const invite = db.getInvite(msg.inviteId);
+      if (!invite) fail('NO_SUCH_INVITE', 'invite not found');
+      requireAdmin(conn, invite.room_id);
+      const revoked = db.revokeInvite(invite.id, conn.userId);
+      if (!revoked) fail('INVITE_UNAVAILABLE', 'invite is no longer active');
+      hub.send(conn, { type: 'invite_revoked', inviteId: invite.id, roomId: invite.room_id });
+      hub.sendToUser(invite.invitee_id, {
+        type: 'invite_closed', inviteId: invite.id, roomId: invite.room_id, reason: 'revoked',
+      });
+    },
+
+    /**
+     * 被邀请人接受邀请。DB 在单个 IMMEDIATE 事务内完成
+     * 「active 条件置 used + 人数上限校验 + 成员关系 upsert」，
+     * 保证成员身份持久落库（members 表）而非仅当前连接临时入房。
+     */
+    invite_accept(conn, msg) {
+      if (!isNonEmptyString(msg.inviteId, 128)) fail('BAD_REQUEST', 'invalid inviteId');
+      const invite = db.getInvite(msg.inviteId);
+      if (!invite) fail('NO_SUCH_INVITE', 'invite not found');
+      if (invite.invitee_id !== conn.userId) fail('FORBIDDEN', 'this invite is not for you');
+
+      const room = db.getRoom(invite.room_id);
+      if (!room) fail('NO_SUCH_ROOM', 'room not found');
+
+      const result = db.acceptInvite(invite.id, { maxOccupancy: room.max_occupancy });
+      if (!result.ok) {
+        const map = {
+          NO_SUCH_INVITE: ['NO_SUCH_INVITE', 'invite not found'],
+          INVITE_EXPIRED: ['INVITE_EXPIRED', 'invite has expired'],
+          INVITE_REVOKED: ['INVITE_REVOKED', 'invite has been revoked'],
+          INVITE_USED: ['INVITE_USED', 'invite has already been used'],
+          ROOM_FULL: ['ROOM_FULL', 'room has reached its member limit'],
+          INVITE_UNAVAILABLE: ['INVITE_UNAVAILABLE', 'invite is no longer available'],
+        };
+        const [code, text] = map[result.reason] || ['INVITE_UNAVAILABLE', 'invite unavailable'];
+        fail(code, text);
+      }
+
+      const { member, alreadyMember } = result;
+      // 当前连接进入房间运行时索引（成员关系此前已持久落库）
+      hub.joinRoom(conn, room.id);
+      hub.send(conn, joinedFrame(room, member));
+      // 断线补发：优先客户端进度，否则服务端游标
+      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
+      if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
+
+      // 同一用户的其他在线设备：被动同步入房并按服务端游标补发
+      const others = hub.byUser.get(conn.userId);
+      if (others) {
+        for (const other of others) {
+          if (other === conn || other.rooms.has(room.id)) continue;
+          hub.joinRoom(other, room.id);
+          hub.send(other, joinedFrame(room, member));
+          const cur = db.getCursor(room.id, conn.userId);
+          if (cur < room.last_seq) replayRoom(other, room.id, cur);
+        }
+      }
+
+      // 通知被邀请人全部设备：该邀请已消费（用于收起邀请条目）
+      hub.sendToUser(conn.userId, {
+        type: 'invite_closed', inviteId: invite.id, roomId: room.id, reason: 'used',
+      });
+
+      if (!alreadyMember) {
+        // 房间内广播新成员加入，在线成员据此刷新成员列表
+        const user = db.getUserById(conn.userId);
+        hub.broadcast(room.id, {
+          type: 'member_joined',
+          roomId: room.id,
+          member: {
+            userId: conn.userId, name: user.name, role: member.role,
+            mutedUntil: member.muted_until, joinedAt: member.joined_at,
+          },
+        });
+      }
     },
   };
 
@@ -377,9 +582,26 @@ function createChatServer(overrides = {}) {
 
   // ---------------------------------------------------------------- 定时任务
 
+  /** 过期邀请收口：active -> revoked，并实时通知被邀请人刷新/收起邀请 */
+  function sweepInvites() {
+    let expired;
+    try {
+      expired = db.sweepExpiredInvites();
+    } catch (err) {
+      console.error('[invite sweep error]', err);
+      return;
+    }
+    for (const inv of expired) {
+      hub.sendToUser(inv.invitee_id, {
+        type: 'invite_closed', inviteId: inv.id, roomId: inv.room_id, reason: 'expired',
+      });
+    }
+  }
+
   const timers = [
     setInterval(() => hub.heartbeatSweep(), config.heartbeatIntervalMs),
     setInterval(() => hub.resendSweep(), config.ackResendIntervalMs),
+    setInterval(sweepInvites, config.inviteSweepIntervalMs),
   ];
   for (const t of timers) t.unref();
 
